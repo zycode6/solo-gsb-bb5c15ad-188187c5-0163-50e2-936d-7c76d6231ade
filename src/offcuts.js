@@ -27,6 +27,12 @@
  * 明确抛错（指出余料编号）拒绝启动，不发布半恢复库存，避免把既有库存当作
  * 空库继续写入。恢复后同批次重复登记仍按来源指纹去重。
  * 未配置快照文件（如单元测试）时退化为纯进程内存模式。
+ *
+ * 落盘精度（共用记录构造路径 normalizeFreeRect + buildRecord 统一保证）：
+ * 纸面宽高、纸面坐标与余料尺寸一律先按 0.001mm（三位小数）舍入，再对舍入后的
+ * 数值做几何校验（尺寸为正 / 坐标非负 / 不越出纸面），面积由舍入后的宽×高计算。
+ * 写入快照的永远是通过校验的同一组数值，启动恢复按同一精度核对，快照中纸面、
+ * 坐标、宽高、面积必然自洽；舍入后为 0 的极小尺寸或越出纸面的输入明确报错。
  */
 
 const fs = require('node:fs');
@@ -41,7 +47,16 @@ const EPS = 1e-6;
 const SNAPSHOT_APP = 'sheet-layout/offcuts';
 const SNAPSHOT_VERSION = 1;
 
+/** 落盘精度（mm）：纸面宽高、纸面坐标与余料尺寸统一保留三位小数 */
+const STORAGE_PRECISION = 0.001;
+
 const round3 = (v) => Math.round(v * 1000) / 1000;
+
+/** 按落盘精度舍入尺寸，并把 -0 归一为 +0（避免快照与去重指纹中出现负零） */
+function roundDim(v) {
+  const r = round3(v);
+  return r === 0 ? 0 : r;
+}
 
 /* ---------------- 存储状态 ---------------- */
 
@@ -482,17 +497,33 @@ function normalizeOffcutShape(raw, pos) {
 
 /**
  * 校验并规范化一个自由矩形的坐标与尺寸（纯校验，不取号、不写库）。
+ * 统一“先落盘舍入、后几何校验”：坐标与尺寸先按落盘精度（0.001mm）舍入，
+ * 再对舍入后的数值做全部校验——保证返回（并最终写盘）的 {x,y,w,h} 与通过
+ * 校验的是同一组值，启动恢复按同一精度核对必然通过。
+ * 舍入后为 0 的极小尺寸（如 0.0004）、负坐标、越出纸面均明确报错。
  * @param {object} free { x, y, w, h }（layout.frees 元素）
  * @param {object} paper { width, height }（已规范化的纸张）
- * @returns {{ x:number, y:number, w:number, h:number }}
+ * @returns {{ x:number, y:number, w:number, h:number }} 已按落盘精度舍入
  */
 function normalizeFreeRect(free, paper) {
-  const x = Number(free.x) || 0;
-  const y = Number(free.y) || 0;
-  const w = positiveNumber(free.w, '余料宽度');
-  const h = positiveNumber(free.h, '余料高度');
-  if (x < -EPS || y < -EPS) throw new Error('余料坐标不能为负');
-  if (x + w > paper.width + EPS || y + h > paper.height + EPS) {
+  const x = roundDim(Number(free.x) || 0);
+  const y = roundDim(Number(free.y) || 0);
+  const rawW = positiveNumber(free.w, '余料宽度');
+  const rawH = positiveNumber(free.h, '余料高度');
+  const w = roundDim(rawW);
+  const h = roundDim(rawH);
+  if (x < 0 || y < 0) throw new Error('余料坐标不能为负');
+  if (!(w > 0)) {
+    throw new Error(`余料宽度 ${rawW} 过小：按 ${STORAGE_PRECISION}mm 落盘精度舍入后为 0，无法入库`);
+  }
+  if (!(h > 0)) {
+    throw new Error(`余料高度 ${rawH} 过小：按 ${STORAGE_PRECISION}mm 落盘精度舍入后为 0，无法入库`);
+  }
+  // 越界判定同样作用于舍入后的数值（纸面宽高按同一精度舍入），
+  // 与 parseSnapshot 恢复时的核对使用同一组值，写盘即必然可恢复
+  const paperW = round3(paper.width);
+  const paperH = round3(paper.height);
+  if (x + w > paperW + EPS || y + h > paperH + EPS) {
     throw new Error('余料矩形超出纸面范围');
   }
   return { x, y, w, h };
@@ -502,7 +533,10 @@ function normalizeFreeRect(free, paper) {
  * 由已校验的自由矩形构造余料记录。
  * id 留空（null），由调用方在确定入库时通过 newOffcutId(state) 赋值，
  * 保证跳过的重复项与校验失败的批次不消耗余料序号。
- * @param {object} rect { x, y, w, h }（normalizeFreeRect 返回）
+ * rect 的坐标/尺寸已在 normalizeFreeRect 按落盘精度舍入，此处原样落盘；
+ * 面积由舍入后的宽×高计算，纸面宽高按同一精度舍入——快照中纸面、坐标、
+ * 宽高、面积自洽，查询 / 预占 / 恢复使用的都是这同一组尺寸。
+ * @param {object} rect { x, y, w, h }（normalizeFreeRect 返回，已舍入校验）
  * @param {object} paper { width, height, kerf, grain }
  * @param {object} meta { type, batchId, sheetIndex, round, paperId, paperName, orderNo }
  */
@@ -515,10 +549,10 @@ function buildRecord(rect, paper, meta) {
     paperHeight: round3(paper.height),
     paperGrain: paper.grain,
     kerf: round3(paper.kerf),
-    x: round3(x),
-    y: round3(y),
-    w: round3(w),
-    h: round3(h),
+    x,
+    y,
+    w,
+    h,
     area: round3(w * h),
     status: 'available', // available（可用） | reserved（已预占）
     source: {

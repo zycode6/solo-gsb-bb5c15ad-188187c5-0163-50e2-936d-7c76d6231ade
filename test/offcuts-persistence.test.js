@@ -429,3 +429,122 @@ test('未配置快照文件时退化为纯内存模式（兼容无持久化部�
   assert.equal(offcut.id, 'OC-000001');
   assert.equal(listOffcuts().count, 1);
 });
+
+/* ---------------- 尺寸精度：落盘自洽、重启可恢复 ---------------- */
+
+test('尺寸精度：100.0004 类小数尺寸按 0.001mm 落盘，快照自洽且重启可恢复', () => {
+  const { offcut } = createOffcut({ width: 100.0004, height: 100.0004 });
+  // 宽高与面积是同一组舍入值：面积 = 舍入后宽×高（不再出现 100×100 配 10000.08）
+  assert.equal(offcut.w, 100);
+  assert.equal(offcut.h, 100);
+  assert.equal(offcut.paperWidth, 100);
+  assert.equal(offcut.paperHeight, 100);
+  assert.equal(offcut.area, 10000);
+
+  // 写盘内容逐字段自洽
+  const onDisk = JSON.parse(fs.readFileSync(snapshotFile, 'utf8'));
+  assert.equal(onDisk.offcuts[0].w, 100);
+  assert.equal(onDisk.offcuts[0].area, 10000);
+
+  // 重启恢复不再被拒绝；查询到的尺寸与落盘值一致
+  const info = initPersistence(snapshotFile);
+  assert.equal(info.restored, true);
+  const rec = listOffcuts().offcuts[0];
+  assert.equal(rec.w, 100);
+  assert.equal(rec.area, 10000);
+
+  // 预占使用同一组落盘尺寸：100×100 成品恰好放下
+  const alloc = allocateOffcuts({ width: 100, height: 100, quantity: 1 });
+  assert.equal(alloc.status, 'fulfilled');
+  initPersistence(snapshotFile);
+  assert.equal(listOffcuts({ status: 'reserved' }).count, 1);
+});
+
+test('尺寸精度：有效三位小数尺寸写入后重启恢复，查询与预占使用同一组尺寸', () => {
+  createOffcut({ width: 100.125, height: 50.5 });
+  initPersistence(snapshotFile);
+  const rec = listOffcuts().offcuts[0];
+  assert.equal(rec.w, 100.125);
+  assert.equal(rec.h, 50.5);
+  assert.equal(rec.area, Math.round(100.125 * 50.5 * 1000) / 1000);
+  // 最小尺寸筛选与预占可行性都按落盘尺寸判定（不多不少）
+  assert.equal(listOffcuts({ minW: 100.125, minH: 50.5 }).count, 1);
+  assert.equal(listOffcuts({ minW: 100.126, minH: 50.5 }).count, 0);
+  const alloc = allocateOffcuts({ width: 100.125, height: 50.5, quantity: 1 });
+  assert.equal(alloc.status, 'fulfilled');
+  const gap = allocateOffcuts({ width: 100.126, height: 50.5, quantity: 1 });
+  assert.equal(gap.status, 'shortfall');
+});
+
+test('尺寸精度：结果登记的小数余料同样自洽落盘、重启可恢复', () => {
+  const sheet = {
+    paper: { width: 100.0004, height: 100.0004, kerf: 0, grain: 'along-width' },
+    frees: [{ x: 0, y: 0, w: 100.0004, h: 100.0004 }],
+  };
+  const out = ingestOffcuts({ layout: sheet, batchId: 'DEC-1' });
+  assert.equal(out.ingested, 1);
+  const rec = listOffcuts().offcuts[0];
+  assert.equal(rec.w, 100);
+  assert.equal(rec.paperWidth, 100);
+  assert.equal(rec.area, 10000);
+  // 重启恢复不抛错，库存原样回来
+  const info = initPersistence(snapshotFile);
+  assert.equal(info.restored, true);
+  assert.equal(listOffcuts().count, 1);
+});
+
+test('尺寸精度：舍入后为零的极小尺寸明确报错，不写盘、编号不前进', () => {
+  assert.throws(() => createOffcut({ width: 0.0004, height: 5 }), /舍入后为 0/);
+  assert.throws(() => createOffcut({ width: 5, height: 0.0004 }), /舍入后为 0/);
+  assert.equal(listOffcuts().count, 0);
+  assert.ok(!fs.existsSync(snapshotFile), '校验失败不得生成快照');
+
+  // 余料号与批次号均未消耗：后续有效录入仍取 OC-000001 / BATCH-000001
+  const ok = createOffcut({ width: 10, height: 10 });
+  assert.equal(ok.offcut.id, 'OC-000001');
+  assert.equal(ok.offcut.source.batchId, 'BATCH-000001');
+});
+
+test('尺寸精度：批量登记含舍入后为零的余料时整批不生效，余料/批次编号不前进', () => {
+  const goodSheet = {
+    paper: { width: 200, height: 100, kerf: 0, grain: 'along-width' },
+    frees: [{ x: 0, y: 0, w: 50, h: 40 }],
+  };
+  const tinySheet = {
+    paper: { width: 200, height: 100, kerf: 0, grain: 'along-width' },
+    frees: [{ x: 0, y: 50, w: 0.0004, h: 40 }], // 宽按 0.001mm 舍入后为 0
+  };
+  assert.throws(
+    () => ingestOffcuts({ layout: { sheets: [goodSheet, tinySheet] } }),
+    /舍入后为 0/
+  );
+  assert.equal(listOffcuts().count, 0);
+  assert.ok(!fs.existsSync(snapshotFile), '整批不生效，不得写盘');
+
+  // 修正后重试：无跳过记录，余料号 / 批次号从 1 开始
+  const retry = ingestOffcuts({ layout: { sheets: [goodSheet] } });
+  assert.equal(retry.ingested, 1);
+  assert.equal(retry.skipped, 0);
+  assert.deepEqual(retry.offcutIds, ['OC-000001']);
+  assert.equal(retry.batchId, 'BATCH-000001');
+});
+
+test('尺寸精度：舍入后越出纸面或坐标为负的余料明确报错（与启动恢复同一核对）', () => {
+  // 原始值看似界内（0.0006+99.9996 = 100.0002 ≤ 纸宽 100.0002），
+  // 但落盘舍入后 0.001+100 = 100.001 越出纸面 100 —— 必须在录入时拒绝，
+  // 而不是写出一个重启后无法恢复的快照
+  const sneaky = {
+    paper: { width: 100.0002, height: 50, kerf: 0, grain: 'along-width' },
+    frees: [{ x: 0.0006, y: 0, w: 99.9996, h: 40 }],
+  };
+  assert.throws(() => ingestOffcuts({ layout: sneaky }), /超出纸面/);
+
+  const negative = {
+    paper: { width: 200, height: 100, kerf: 0, grain: 'along-width' },
+    frees: [{ x: -0.6, y: 0, w: 10, h: 10 }],
+  };
+  assert.throws(() => ingestOffcuts({ layout: negative }), /坐标不能为负/);
+
+  assert.equal(listOffcuts().count, 0);
+  assert.ok(!fs.existsSync(snapshotFile));
+});
