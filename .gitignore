@@ -1,0 +1,7 @@
+node_modules/
+npm-debug.log*
+.DS_Store
+*.log
+
+# 本地直接运行时的余料库存快照目录（Docker 部署使用命名数据卷）
+data/

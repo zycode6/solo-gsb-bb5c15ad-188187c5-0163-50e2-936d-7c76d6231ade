@@ -1,0 +1,20 @@
+services:
+  sheet-layout:
+    build: .
+    image: sheet-layout:latest
+    container_name: sheet-layout
+    ports:
+      # 默认映射到宿主机 3000；可用 `PORT=8080 docker compose up -d --build` 改宿主端口
+      - "${PORT:-3000}:3000"
+    environment:
+      - NODE_ENV=production
+      # 余料库存快照文件（容器内路径，位于挂载的数据卷中）
+      - OFFCUTS_SNAPSHOT=/app/data/offcuts-snapshot.json
+    volumes:
+      # 余料库存、预占关系与自动编号持久化到命名数据卷；
+      # 重建 / 更新容器后库存不丢，重启服务自动恢复
+      - sheet-layout-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  sheet-layout-data:
