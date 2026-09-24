@@ -154,6 +154,51 @@ test('校验：手工录入与结果非法输入返回 400 信息', () => {
   assert.throws(() => ingestOffcuts({ layout: { frees: [] } }), /无法识别/);
 });
 
+test('落盘精度：小数尺寸按 0.001mm 舍入落盘，宽高与面积自洽', () => {
+  // 100.0004 舍入为 100：宽、高、纸面与面积（100×100=10000）彼此一致
+  const { offcut } = createOffcut({ width: 100.0004, height: 100.0004 });
+  assert.equal(offcut.w, 100);
+  assert.equal(offcut.h, 100);
+  assert.equal(offcut.paperWidth, 100);
+  assert.equal(offcut.paperHeight, 100);
+  assert.equal(offcut.area, 10000);
+
+  // 三位小数尺寸精确落盘，面积由落盘宽高计算
+  const { offcut: dec } = createOffcut({ width: 100.5, height: 80.25, kerf: 0.0004 });
+  assert.equal(dec.w, 100.5);
+  assert.equal(dec.h, 80.25);
+  assert.equal(dec.kerf, 0);
+  assert.equal(dec.area, 8065.125);
+
+  // 查询与预占使用同一组落盘尺寸
+  assert.equal(listOffcuts({ minW: 100.5, minH: 80.25 }).count, 1);
+  assert.equal(listOffcuts({ minW: 100.6, minH: 80.25 }).count, 0);
+  const alloc = allocateOffcuts({ width: 100.5, height: 80.25, quantity: 1 });
+  assert.equal(alloc.status, 'fulfilled');
+  assert.equal(alloc.reserved[0].offcutId, dec.id);
+  assert.equal(alloc.reserved[0].residualArea, 0);
+});
+
+test('落盘精度：正数尺寸舍入后为零明确报错，编号不前进', () => {
+  assert.throws(() => createOffcut({ width: 0.0004, height: 10 }), /舍入后为零/);
+  assert.throws(() => createOffcut({ width: 10, height: 0.0004 }), /舍入后为零/);
+  // 结果登记路径同样拒绝（含纸张尺寸舍入后为零）
+  assert.throws(
+    () => ingestOffcuts({
+      layout: { paper: { width: 100, height: 100 }, frees: [{ x: 0, y: 0, w: 0.0004, h: 50 }] },
+    }),
+    /舍入后为零/
+  );
+  assert.throws(
+    () => ingestOffcuts({ layout: { paper: { width: 0.0004, height: 100 }, frees: [] } }),
+    /舍入后为零/
+  );
+  // 全部失败不消耗余料 / 批次序号
+  const { offcut } = createOffcut({ width: 10, height: 10 });
+  assert.equal(offcut.id, 'OC-000001');
+  assert.equal(offcut.source.batchId, 'BATCH-000001');
+});
+
 /* ---------------- 查询 ---------------- */
 
 test('查询：状态 / 最小尺寸 / 纹向 / 关键字筛选与汇总', () => {
@@ -380,6 +425,41 @@ test('批量登记原子性：后一张余料越界时整批不写入，序号�
   assert.equal(listOffcuts().count, 0);
 
   // 修正后重试：无跳过记录、余料编号从 1 开始、批次号也是第 1 个
+  const retry = ingestOffcuts({ layout: { sheets: [goodSheet] } });
+  assert.equal(retry.ingested, 1);
+  assert.equal(retry.skipped, 0);
+  assert.deepEqual(retry.offcutIds, ['OC-000001']);
+  assert.equal(retry.batchId, 'BATCH-000001');
+});
+
+test('批量登记原子性：舍入后为零或舍入后越界的余料使整批不生效，编号不前进', () => {
+  const goodSheet = {
+    paper: { width: 200, height: 100, kerf: 0, grain: 'along-width' },
+    frees: [{ x: 0, y: 0, w: 50, h: 40 }],
+  };
+  // 极小正数余料：按 0.001mm 落盘精度舍入后为零
+  const tinySheet = {
+    paper: { width: 200, height: 100, kerf: 0, grain: 'along-width' },
+    frees: [{ x: 100, y: 0, w: 0.0004, h: 40 }],
+  };
+  assert.throws(
+    () => ingestOffcuts({ layout: { sheets: [goodSheet, tinySheet] } }),
+    /舍入后为零/
+  );
+  assert.equal(listOffcuts().count, 0);
+
+  // 舍入后越出纸面：x 舍入为 150.001，150.001+50 越出 200 宽纸面
+  const overflowSheet = {
+    paper: { width: 200, height: 100, kerf: 0, grain: 'along-width' },
+    frees: [{ x: 150.0006, y: 0, w: 50, h: 40 }],
+  };
+  assert.throws(
+    () => ingestOffcuts({ layout: { sheets: [goodSheet, overflowSheet] } }),
+    /超出纸面/
+  );
+  assert.equal(listOffcuts().count, 0);
+
+  // 修正后重试：无跳过记录、余料编号与批次号均从 1 开始
   const retry = ingestOffcuts({ layout: { sheets: [goodSheet] } });
   assert.equal(retry.ingested, 1);
   assert.equal(retry.skipped, 0);

@@ -462,6 +462,14 @@ schedule/workOrder 不一致（刀次缺来源批次、与排程批次成员不�
 > 恢复余料、预占关系与三个编号；**快照文件存在但内容损坏时明确拒绝启动**（不会把既有库存
 > 当作空库继续运行）。恢复后同一来源批次重复登记仍按来源指纹去重。
 
+> 尺寸精度：余料的**纸面宽高、刀缝、纸面坐标与余料宽高统一按 0.001mm 精度舍入落盘**，
+> **面积由舍入后的宽×高计算**——快照中纸面、坐标、宽高与面积始终自洽，重启恢复按同一组
+> 数值重算校验必然通过，查询筛选与复用预占使用的也是这组落盘尺寸。例如录入
+> `100.0004×100.0004` 会落盘为 `100×100`、面积 `10000`；录入 `100.5×80.25` 则原样保留、
+> 面积 `8065.125`。**正数尺寸舍入后为零（如 `0.0004`）或舍入后越出纸面的输入明确报错
+> （HTTP 400），批量登记时任一余料无效则整批不生效、余料/批次编号不前进**，
+> 不会写入重启后必然被拒绝的快照。
+
 **查询**：按状态（**全部 / 可用 / 已预占**）、最小可容纳尺寸（允许旋转比较）、
 纸张纹向与关键字（纸型 / 批次 / 订单号 / 编号）筛选；返回汇总
 （总数、可用 / 已预占块数与面积、库存总面积）与明细列表。
@@ -657,8 +665,8 @@ npm start          # 默认 http://localhost:3000，可用 PORT=8080 npm start �
 
 ### 余料库存与复用预占
 
-- `POST /api/offcuts` — 手工录入一条余料（`paperName?`、`width`、`height`、`paperGrain?`、`kerf?`、`batchId?`、`orderNo?`；返回余料记录与库存汇总，HTTP 201）
-- `POST /api/offcuts/ingest` — 从现有排料结果批量登记（`layout` 传单张 / 比选 / 批量 / 多纸型成本返回；`batchId?` 来源批次号，缺省自动生成；同批次相同余料去重，返回 `ingested`/`skipped`/`offcutIds`；**原子登记**——任一余料无效时整批不写入、不消耗自动序号，HTTP 400）
+- `POST /api/offcuts` — 手工录入一条余料（`paperName?`、`width`、`height`、`paperGrain?`、`kerf?`、`batchId?`、`orderNo?`；尺寸按 0.001mm 精度舍入落盘，舍入后为零返回 HTTP 400；返回余料记录与库存汇总，HTTP 201）
+- `POST /api/offcuts/ingest` — 从现有排料结果批量登记（`layout` 传单张 / 比选 / 批量 / 多纸型成本返回；`batchId?` 来源批次号，缺省自动生成；同批次相同余料去重，返回 `ingested`/`skipped`/`offcutIds`；**原子登记**——任一余料无效（舍入后为零、越出纸面等）时整批不写入、不消耗自动序号，HTTP 400）
 - `GET /api/offcuts` — 余料查询（`status=all|available|reserved`、`minW`/`minH` 最小可容纳尺寸、`grain` 纸张纹向、`q` 关键字；返回 `summary`、遵循筛选的余料明细 `offcuts`（及 `count`），**另返回同次库存读取、不随筛选裁剪的完整已预占单分组 `allocationGroups`**：组内编号 / 总块数 `count` / 整单释放始终对应整单，无匹配明细但有预占单时仍返回该分组）
 - `POST /api/offcuts/allocate` — 复用预占（`width`、`height`、`quantity`、`grain?`、`ref?`；成功返回 `status:'fulfilled'`、`allocationId` 与 `reserved` 明细；缺口返回 `status:'shortfall'`、`shortfall`、`blockedBySize`、`blockedGrain`、`unavailableReserved` 与可行候选，**不改动任何记录**，HTTP 200）
 - `POST /api/offcuts/release` — 释放预占（`allocationIds?` 预占单号数组或 `offcutIds?` 余料编号数组；成功返回释放块数与库存汇总，编号非法 / 未预占返回 HTTP 400）

@@ -131,6 +131,103 @@ test('持久化：快照文件不存在时从空库启动，首次变更后生�
   assert.ok(fs.existsSync(missing), '首次写入应自动创建目录并生成快照文件');
 });
 
+/* ---------------- 落盘精度：快照自洽与重启恢复 ---------------- */
+
+test('落盘精度：100.0004 舍入落盘为 100，快照中宽高与面积自洽，重启可恢复', () => {
+  // 100.0004×100.0004：宽高与纸面舍入为 100，面积按落盘宽高计为 10000
+  const { offcut } = createOffcut({ width: 100.0004, height: 100.0004 });
+  assert.equal(offcut.w, 100);
+  assert.equal(offcut.h, 100);
+  assert.equal(offcut.paperWidth, 100);
+  assert.equal(offcut.paperHeight, 100);
+  assert.equal(offcut.area, 10000);
+
+  // 磁盘快照同样自洽（宽高 100、面积 10000，而非面积 10000.08）
+  const onDisk = JSON.parse(fs.readFileSync(snapshotFile, 'utf8'));
+  assert.equal(onDisk.offcuts[0].w, 100);
+  assert.equal(onDisk.offcuts[0].h, 100);
+  assert.equal(onDisk.offcuts[0].area, 10000);
+
+  // 重启恢复不再因“面积与宽×高不一致”被拒绝；
+  // 恢复后查询与预占使用同一组落盘尺寸
+  const info = initPersistence(snapshotFile);
+  assert.equal(info.restored, true);
+  assert.equal(info.offcutCount, 1);
+  const restored = listOffcuts().offcuts[0];
+  assert.equal(restored.w, 100);
+  assert.equal(restored.area, 10000);
+  assert.equal(listOffcuts({ minW: 100, minH: 100 }).count, 1);
+  const alloc = allocateOffcuts({ width: 100, height: 100, quantity: 1 });
+  assert.equal(alloc.status, 'fulfilled');
+  assert.equal(alloc.reserved[0].residualArea, 0);
+});
+
+test('落盘精度：三位小数尺寸精确落盘，重启恢复后查询与预占沿用同一组尺寸', () => {
+  const { offcut } = createOffcut({ width: 100.5, height: 80.25, kerf: 0.5 });
+  assert.equal(offcut.w, 100.5);
+  assert.equal(offcut.h, 80.25);
+  assert.equal(offcut.area, 8065.125); // 由落盘宽高 100.5×80.25 计算
+
+  initPersistence(snapshotFile);
+  const restored = listOffcuts().offcuts[0];
+  assert.equal(restored.w, 100.5);
+  assert.equal(restored.h, 80.25);
+  assert.equal(restored.area, 8065.125);
+  // 查询最小尺寸与预占可行性都按落盘尺寸判定
+  assert.equal(listOffcuts({ minW: 100.5, minH: 80.25 }).count, 1);
+  assert.equal(listOffcuts({ minW: 100.6, minH: 80.25 }).count, 0);
+  const alloc = allocateOffcuts({ width: 100.5, height: 80.25, quantity: 1 });
+  assert.equal(alloc.status, 'fulfilled');
+  assert.equal(alloc.reserved[0].residualArea, 0);
+});
+
+test('落盘精度：排料结果登记的小数纸面 / 坐标 / 余料一致舍入，重启可恢复', () => {
+  const sheet = {
+    paper: { width: 100.0004, height: 60.25, kerf: 0.0004, grain: 'along-width' },
+    frees: [{ x: 0.0004, y: 0, w: 100.0004, h: 60.25 }],
+  };
+  const out = ingestOffcuts({ layout: sheet, batchId: 'DEC-1' });
+  assert.equal(out.ingested, 1);
+  const rec = listOffcuts().offcuts[0];
+  // 纸面、坐标、余料宽高与刀缝按同一精度舍入，彼此自洽
+  assert.equal(rec.paperWidth, 100);
+  assert.equal(rec.x, 0);
+  assert.equal(rec.w, 100);
+  assert.equal(rec.h, 60.25);
+  assert.equal(rec.kerf, 0);
+  assert.equal(rec.area, 6025);
+
+  const info = initPersistence(snapshotFile);
+  assert.equal(info.restored, true);
+  assert.equal(listOffcuts().count, 1);
+});
+
+test('落盘精度：舍入后为零或越出纸面的输入明确报错，不写快照、编号不前进', () => {
+  // 极小正数舍入后为零：手工录入与结果登记都明确报错
+  assert.throws(() => createOffcut({ width: 0.0004, height: 10 }), /舍入后为零/);
+  assert.throws(() => createOffcut({ width: 10, height: 0.0004 }), /舍入后为零/);
+  assert.throws(
+    () => ingestOffcuts({
+      layout: { paper: { width: 100, height: 100 }, frees: [{ x: 0, y: 0, w: 0.0004, h: 50 }] },
+    }),
+    /舍入后为零/
+  );
+  // 舍入后越出纸面：x 舍入为 50.001，50.001+50 越出 100 宽纸面
+  assert.throws(
+    () => ingestOffcuts({
+      layout: { paper: { width: 100, height: 100 }, frees: [{ x: 50.0006, y: 0, w: 50, h: 40 }] },
+    }),
+    /超出纸面/
+  );
+
+  // 全部失败：库存为空、未生成快照文件、三个编号均未前进
+  assert.equal(listOffcuts().count, 0);
+  assert.equal(fs.existsSync(snapshotFile), false);
+  const ok = createOffcut({ width: 10, height: 10 });
+  assert.equal(ok.offcut.id, 'OC-000001');
+  assert.equal(ok.offcut.source.batchId, 'BATCH-000001');
+});
+
 /* ---------------- 写盘失败：库存与三个编号均不前进 ---------------- */
 
 test('写盘失败：手工录入抛 SnapshotError，库存与余料/批次序号不前进', () => {

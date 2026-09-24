@@ -27,6 +27,14 @@
  * 明确抛错（指出余料编号）拒绝启动，不发布半恢复库存，避免把既有库存当作
  * 空库继续写入。恢复后同批次重复登记仍按来源指纹去重。
  * 未配置快照文件（如单元测试）时退化为纯进程内存模式。
+ *
+ * 落盘精度（手工录入与结果登记共用的记录构造路径统一执行）：
+ * 纸面宽高、刀缝、纸面坐标与余料宽高一律先舍入到 0.001mm（round3），
+ * 再对舍入后的落盘值做几何校验（正数、坐标非负、不越出纸面），
+ * 面积由舍入后的宽×高计算——快照中纸面、坐标、宽高与面积因此彼此自洽，
+ * 重启恢复按同一组数值重算必然通过；查询与预占读取的也是这组落盘尺寸。
+ * 正数尺寸舍入后为零（如 0.0004）或舍入后越出纸面的输入明确报错（HTTP 400），
+ * 不会写入重启后必然被拒绝的快照。
  */
 
 const fs = require('node:fs');
@@ -41,7 +49,21 @@ const EPS = 1e-6;
 const SNAPSHOT_APP = 'sheet-layout/offcuts';
 const SNAPSHOT_VERSION = 1;
 
+/** 落盘精度：所有持久化的尺寸 / 坐标 / 面积统一舍入到 0.001（mm） */
 const round3 = (v) => Math.round(v * 1000) / 1000;
+
+/**
+ * 正数尺寸按落盘精度舍入；舍入后为零时明确报错——
+ * 否则快照会留下 0 尺寸记录，重启恢复必然被几何校验拒绝。
+ */
+function roundPersisted(value, subject) {
+  const r = round3(value);
+  if (!(r > 0)) {
+    throw new Error(`${subject}按 0.001mm 精度舍入后为零（原值 ${value}），`
+      + '请使用不小于 0.001 的尺寸');
+  }
+  return r;
+}
 
 /* ---------------- 存储状态 ---------------- */
 
@@ -471,9 +493,11 @@ function explicitBatchId(value) {
 /** 规范化单条余料的纸型 / 几何字段（手工录入与结果登记共用） */
 function normalizeOffcutShape(raw, pos) {
   const who = pos ? `第 ${pos} 条余料的` : '';
-  const width = positiveNumber(raw.width, `${who}宽度`);
-  const height = positiveNumber(raw.height, `${who}高度`);
-  const kerf = raw.kerf == null || raw.kerf === '' ? 0 : nonNegativeNumber(raw.kerf, `${who}刀缝宽度`);
+  const width = roundPersisted(positiveNumber(raw.width, `${who}宽度`), `${who}宽度`);
+  const height = roundPersisted(positiveNumber(raw.height, `${who}高度`), `${who}高度`);
+  const kerf = raw.kerf == null || raw.kerf === ''
+    ? 0
+    : round3(nonNegativeNumber(raw.kerf, `${who}刀缝宽度`));
   const paperGrain = normalizePaperGrain(raw.paperGrain || raw.grain, '余料纸张');
   return { width, height, kerf, paperGrain };
 }
@@ -482,17 +506,22 @@ function normalizeOffcutShape(raw, pos) {
 
 /**
  * 校验并规范化一个自由矩形的坐标与尺寸（纯校验，不取号、不写库）。
+ * 坐标与尺寸先舍入到落盘精度（0.001mm），几何校验针对舍入后的落盘值：
+ * 正数尺寸舍入后为零、坐标为负或矩形越出（同样已舍入的）纸面均明确报错，
+ * 保证通过校验的值与最终快照持久化的值完全一致。
  * @param {object} free { x, y, w, h }（layout.frees 元素）
  * @param {object} paper { width, height }（已规范化的纸张）
  * @returns {{ x:number, y:number, w:number, h:number }}
  */
 function normalizeFreeRect(free, paper) {
-  const x = Number(free.x) || 0;
-  const y = Number(free.y) || 0;
-  const w = positiveNumber(free.w, '余料宽度');
-  const h = positiveNumber(free.h, '余料高度');
-  if (x < -EPS || y < -EPS) throw new Error('余料坐标不能为负');
-  if (x + w > paper.width + EPS || y + h > paper.height + EPS) {
+  const paperW = round3(paper.width);
+  const paperH = round3(paper.height);
+  const x = round3(Number(free.x) || 0);
+  const y = round3(Number(free.y) || 0);
+  const w = roundPersisted(positiveNumber(free.w, '余料宽度'), '余料宽度');
+  const h = roundPersisted(positiveNumber(free.h, '余料高度'), '余料高度');
+  if (x < 0 || y < 0) throw new Error('余料坐标不能为负');
+  if (x + w > paperW + EPS || y + h > paperH + EPS) {
     throw new Error('余料矩形超出纸面范围');
   }
   return { x, y, w, h };
@@ -500,6 +529,10 @@ function normalizeFreeRect(free, paper) {
 
 /**
  * 由已校验的自由矩形构造余料记录。
+ * rect 与 paper 的尺寸 / 坐标均已按落盘精度舍入（见 normalizeFreeRect /
+ * normalizeLayoutPaper / normalizeOffcutShape），此处 round3 为幂等兜底；
+ * 面积由舍入后的宽×高计算，与快照恢复时按存储宽高重算的结果一致，
+ * 保证纸面、坐标、宽高与面积在快照中自洽。
  * id 留空（null），由调用方在确定入库时通过 newOffcutId(state) 赋值，
  * 保证跳过的重复项与校验失败的批次不消耗余料序号。
  * @param {object} rect { x, y, w, h }（normalizeFreeRect 返回）
@@ -555,9 +588,11 @@ function normalizeLayoutPaper(layoutResult) {
     throw new Error('缺少有效的单张排料结果（需包含 paper 与 frees）');
   }
   return {
-    width: positiveNumber(layoutResult.paper.width, '纸张宽度'),
-    height: positiveNumber(layoutResult.paper.height, '纸张高度'),
-    kerf: layoutResult.paper.kerf == null ? 0 : nonNegativeNumber(layoutResult.paper.kerf, '刀缝宽度'),
+    width: roundPersisted(positiveNumber(layoutResult.paper.width, '纸张宽度'), '纸张宽度'),
+    height: roundPersisted(positiveNumber(layoutResult.paper.height, '纸张高度'), '纸张高度'),
+    kerf: layoutResult.paper.kerf == null
+      ? 0
+      : round3(nonNegativeNumber(layoutResult.paper.kerf, '刀缝宽度')),
     grain: normalizePaperGrain(layoutResult.paper.grain, '纸张'),
   };
 }
